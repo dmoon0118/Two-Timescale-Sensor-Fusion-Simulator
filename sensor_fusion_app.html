@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Two-Timescale Sensor Fusion Simulator</title>
+<style>
+:root{
+  --bg:#0f1420; --panel:#171e2e; --line:#2a3348; --text:#e8ecf5; --muted:#8a92a8;
+  --A:#9aa0ac; --B:#f0924a; --C:#4c8ef0; --D:#3fbf6a; --ok:#2b3346; --supp:#c04848;
+  padding-top: env(safe-area-inset-top,0px); padding-bottom: env(safe-area-inset-bottom,0px);
+}
+*{box-sizing:border-box;}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,sans-serif;}
+.wrap{max-width:1200px;margin:0 auto;padding:20px 16px 32px;}
+h1{font-size:20px;font-weight:600;margin:0 0 4px;}
+.sub{color:var(--muted);font-size:13px;margin-bottom:18px;}
+.grid{display:grid;grid-template-columns:1.3fr 1fr;gap:16px;}
+@media(max-width:820px){.grid{grid-template-columns:1fr;}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;}
+.card h2{font-size:13px;font-weight:600;color:var(--muted);margin:0 0 10px;text-transform:uppercase;letter-spacing:.04em;}
+canvas{width:100%;display:block;border-radius:8px;background:#0b0f18;}
+#traj{height:340px;}
+#err{height:200px;}
+.legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:10px;font-size:12px;color:var(--muted);}
+.legend span{display:inline-flex;align-items:center;gap:6px;}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block;}
+.status-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px;}
+.status-table th{text-align:left;color:var(--muted);font-weight:500;padding:4px 6px;font-size:11px;text-transform:uppercase;}
+.status-table td{padding:6px;border-top:1px solid var(--line);}
+.pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600;}
+.pill.ok{background:var(--ok);color:#8fd6a8;}
+.pill.supp{background:var(--supp);color:#ffd7d7;}
+.btnrow{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px;}
+button{background:#1e2740;color:var(--text);border:1px solid var(--line);border-radius:8px;
+  padding:10px 14px;font-size:13px;cursor:pointer;transition:.15s;flex:1;min-width:130px;}
+button:hover{background:#28324f;border-color:#3a4664;}
+button.reset{background:#3a2323;border-color:#5a3333;}
+button.reset:hover{background:#4a2b2b;}
+.meta{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:8px;}
+.errbig{font-weight:700;font-size:14px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Two-Timescale Sensor Fusion — Live Simulator</h1>
+  <div class="sub">Watch four filters guess a virtual robot's position from the same noisy sensors. Inject a fault and see how each one reacts.</div>
+  <div class="grid">
+    <div class="card">
+      <h2>Trajectory: ground truth vs. each filter's estimate</h2>
+      <canvas id="traj" height="380"></canvas>
+      <div class="legend" id="legend1"></div>
+      <div class="meta"><span id="simtime">t = 0.0s</span><span id="activefaults">faults: none</span></div>
+    </div>
+    <div class="card">
+      <h2>Position error (m) — last 20s</h2>
+      <canvas id="err" height="200"></canvas>
+      <table class="status-table" id="statusTable"></table>
+    </div>
+  </div>
+  <div class="btnrow">
+    <button onclick="triggerWheelSlip()">Wheel Slip (3s)</button>
+    <button onclick="triggerImuVib()">IMU Vibration (5s)</button>
+    <button onclick="triggerFlowDeg()">Optical Degradation (4s)</button>
+    <button onclick="triggerRough()">Rough Terrain (10s)</button>
+    <button onclick="triggerCombined()">Combined Fault (8s)</button>
+    <button class="reset" onclick="resetSim()">Reset</button>
+  </div>
+</div>
+<script>
+const DT=0.05;
+const SIG0={enc:0.02,flow:0.03,imu:0.05};
+const R0=[SIG0.enc**2,SIG0.flow**2,SIG0.imu**2];
+const FAST_THRESH=3.0, FAST_INFLATE=1000.0, ALPHA=0.1, SUPPRESS_RATIO=5.0, FAST_GAIN=8.0;
+const GROUPS=["fixed","inhibition","adaptive","bio"];
+const LABEL={fixed:"A: Fixed EKF",inhibition:"B: Lateral Inhibition Only",adaptive:"C: Conventional Adaptive EKF",bio:"D: Two-Timescale EKF (proposed)"};
+const COLOR={fixed:"#9aa0ac",inhibition:"#f0924a",adaptive:"#4c8ef0",bio:"#3fbf6a"};
+const H=[[0,0,0,1,0],[0,0,0,1,0],[0,0,0,0,1]];
+
+function zeros(n,m){return Array.from({length:n},()=>new Array(m).fill(0));}
+function matMul(A,B){const n=A.length,k=A[0].length,m=B[0].length;const C=zeros(n,m);
+  for(let i=0;i<n;i++)for(let j=0;j<m;j++){let s=0;for(let l=0;l<k;l++)s+=A[i][l]*B[l][j];C[i][j]=s;}return C;}
+function transpose(A){const n=A.length,m=A[0].length;const T=zeros(m,n);for(let i=0;i<n;i++)for(let j=0;j<m;j++)T[j][i]=A[i][j];return T;}
+function addMat(A,B){return A.map((r,i)=>r.map((v,j)=>v+B[i][j]));}
+function subMat(A,B){return A.map((r,i)=>r.map((v,j)=>v-B[i][j]));}
+function eye(n){const I=zeros(n,n);for(let i=0;i<n;i++)I[i][i]=1;return I;}
+function invert3(M){
+  const a=M[0][0],b=M[0][1],c=M[0][2],d=M[1][0],e=M[1][1],f=M[1][2],g=M[2][0],h=M[2][1],i=M[2][2];
+  const A=e*i-f*h, B=-(d*i-f*g), C=d*h-e*g;
+  const det=a*A+b*B+c*C;
+  const D=-(b*i-c*h), E=a*i-c*g, F=-(a*h-b*g);
+  const G=b*f-c*e, Hh=-(a*f-c*d), I2=a*e-b*d;
+  return [[A/det,D/det,G/det],[B/det,E/det,Hh/det],[C/det,F/det,I2/det]];
+}
+function randn(){let u=0,v=0;while(u===0)u=Math.random();while(v===0)v=Math.random();
+  return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
+
+class TrueRobot{
+  constructor(){this.t=0;this.x=0;this.y=0;this.theta=0;}
+  step(){const v=0.25, omega=0.5*Math.sin(2*Math.PI*this.t/15.0);
+    this.x+=v*Math.cos(this.theta)*DT; this.y+=v*Math.sin(this.theta)*DT;
+    this.theta+=omega*DT; this.t+=DT; return [v,omega];}
+}
+
+class Filt{
+  constructor(mode){this.mode=mode;
+    this.x=[0,0,0,0.25,0]; this.P=[[1e-3,0,0,0,0],[0,1e-3,0,0,0],[0,0,1e-3,0,0],[0,0,0,0.1,0],[0,0,0,0,0.1]];
+    this.Rbar=[...R0]; this.rho=1.0;
+    this.Q=[[1e-8,0,0,0,0],[0,1e-8,0,0,0],[0,0,1e-8,0,0],[0,0,0,0.05**2*DT,0],[0,0,0,0,0.15**2*DT]];
+    this.suppressed=[false,false,false]; this.trail=[]; this.errHist=[];
+  }
+  f(x){const[px,py,th,v,om]=x; return [px+v*Math.cos(th)*DT, py+v*Math.sin(th)*DT, th+om*DT, v, om];}
+  Fjac(x){const[px,py,th,v,om]=x; const F=eye(5);
+    F[0][2]=-v*Math.sin(th)*DT; F[0][3]=Math.cos(th)*DT;
+    F[1][2]=v*Math.cos(th)*DT; F[1][3]=Math.sin(th)*DT; F[2][4]=DT; return F;}
+  step(z){
+    const Fk=this.Fjac(this.x); const xPred=this.f(this.x);
+    const Pp=addMat(matMul(matMul(Fk,this.P),transpose(Fk)),this.Q);
+    const Hx=[xPred[3],xPred[3],xPred[4]];
+    const y=[z[0]-Hx[0],z[1]-Hx[1],z[2]-Hx[2]];
+    const HP=matMul(H,Pp); const HPHt=matMul(HP,transpose(H));
+    const sbase=[HPHt[0][0],HPHt[1][1],HPHt[2][2]];
+    let Reff=[0,0,0];
+    if(this.mode==="fixed"){Reff=[...R0];}
+    else if(this.mode==="inhibition"){
+      Reff=[...R0];
+      const sr=[0,1,2].map(i=>Math.abs(y[i])/Math.sqrt(sbase[i]+R0[i]));
+      this.suppressed=sr.map(s=>s>FAST_THRESH);
+      this.suppressed.forEach((s,i)=>{if(s)Reff[i]*=FAST_INFLATE;});
+    } else if(this.mode==="adaptive"){
+      const sr=[0,1,2].map(i=>Math.abs(y[i])/Math.sqrt(sbase[i]+this.Rbar[i]*this.rho));
+      const meanSq=sr.reduce((a,s)=>a+s*s,0)/3;
+      this.rho=(1-ALPHA)*this.rho+ALPHA*Math.max(1.0,meanSq);
+      Reff=R0.map(r=>r*this.rho);
+      this.suppressed=[0,1,2].map(()=>this.rho>SUPPRESS_RATIO);
+    } else if(this.mode==="bio"){
+      const srSlow=[0,1,2].map(i=>Math.abs(y[i])/Math.sqrt(sbase[i]+this.Rbar[i]));
+      this.suppressed=srSlow.map(s=>s>FAST_THRESH);
+      const fastMult=srSlow.map(s=>{const over=Math.max(0,s-FAST_THRESH); return Math.min(1+FAST_GAIN*over*over,FAST_INFLATE);});
+      for(let i=0;i<3;i++){this.Rbar[i]=(1-ALPHA)*this.Rbar[i]+ALPHA*Math.max(R0[i],y[i]*y[i]);}
+      Reff=this.Rbar.map((r,i)=>r*fastMult[i]);
+    }
+    const Rmat=[[Reff[0],0,0],[0,Reff[1],0],[0,0,Reff[2]]];
+    const S=addMat(HPHt,Rmat); const Sinv=invert3(S);
+    const K=matMul(matMul(Pp,transpose(H)),Sinv);
+    const Ky=K.map(row=>row[0]*y[0]+row[1]*y[1]+row[2]*y[2]);
+    this.x=xPred.map((v,i)=>v+Ky[i]);
+    const KH=matMul(K,H);
+    this.P=matMul(subMat(eye(5),KH),Pp);
+    this.trail.push([this.x[0],this.x[1]]); if(this.trail.length>1200)this.trail.shift();
+  }
+}
+
+let robot, filters, faultEnd, sigmaMult, faultBiasEnc, trueTrail;
+function resetSim(){
+  robot=new TrueRobot();
+  filters={}; GROUPS.forEach(g=>filters[g]=new Filt(g));
+  faultEnd={enc:-1,flow:-1,imu:-1}; sigmaMult={enc:1,flow:1,imu:1}; faultBiasEnc=0;
+  trueTrail=[];
+}
+function trigger(sensor,duration,mult,bias=0){
+  faultEnd[sensor]=robot.t+duration; sigmaMult[sensor]=mult; if(sensor==="enc")faultBiasEnc=bias;
+}
+function triggerWheelSlip(){trigger("enc",3.0,8.0,0.5);}
+function triggerImuVib(){trigger("imu",5.0,7.0);}
+function triggerFlowDeg(){trigger("flow",4.0,10.0);}
+function triggerRough(dur=10.0){trigger("enc",dur,2.0); trigger("flow",dur,2.0); trigger("imu",dur,6.0);}
+function triggerCombined(){triggerRough(8.0); trigger("enc",Math.min(3.0,8.0),10.0,0.5);}
+
+function currentSigma(sensor,base){return base*(robot.t<faultEnd[sensor]?sigmaMult[sensor]:1.0);}
+
+const trajCanvas=document.getElementById('traj'), errCanvas=document.getElementById('err');
+const trajCtx=trajCanvas.getContext('2d'), errCtx=errCanvas.getContext('2d');
+function fitCanvas(c){const r=c.getBoundingClientRect(); c.width=r.width*devicePixelRatio; c.height=c.height*devicePixelRatio/1; }
+function resizeCanvases(){[trajCanvas,errCanvas].forEach(c=>{const r=c.getBoundingClientRect();c.width=r.width*devicePixelRatio;c.height=r.height*devicePixelRatio;});}
+window.addEventListener('resize',resizeCanvases);
+
+document.getElementById('legend1').innerHTML = ['Ground Truth',...GROUPS.map(g=>LABEL[g])].map((l,idx)=>{
+  const c = idx===0? '#fff':COLOR[GROUPS[idx-1]];
+  return `<span><span class="dot" style="background:${c}"></span>${l}</span>`;
+}).join('');
+
+function drawTraj(){
+  const ctx=trajCtx, W=trajCanvas.width, Ht=trajCanvas.height;
+  ctx.clearRect(0,0,W,Ht);
+  let allX=trueTrail.map(p=>p[0]), allY=trueTrail.map(p=>p[1]);
+  GROUPS.forEach(g=>{filters[g].trail.forEach(p=>{allX.push(p[0]);allY.push(p[1]);});});
+  if(allX.length<2)return;
+  const minX=Math.min(...allX)-0.4, maxX=Math.max(...allX)+0.4;
+  const minY=Math.min(...allY)-0.4, maxY=Math.max(...allY)+0.4;
+  const sx=W/(maxX-minX||1), sy=Ht/(maxY-minY||1), s=Math.min(sx,sy);
+  const ox=(W-(maxX-minX)*s)/2, oy=(Ht-(maxY-minY)*s)/2;
+  const px=(x)=>ox+(x-minX)*s, py=(y)=>Ht-(oy+(y-minY)*s);
+  function drawLine(trail,color,dashed){
+    ctx.beginPath(); ctx.strokeStyle=color; ctx.lineWidth=2*devicePixelRatio;
+    if(dashed)ctx.setLineDash([6*devicePixelRatio,5*devicePixelRatio]); else ctx.setLineDash([]);
+    trail.forEach((p,i)=>{const X=px(p[0]),Y=py(p[1]); if(i===0)ctx.moveTo(X,Y); else ctx.lineTo(X,Y);});
+    ctx.stroke();
+  }
+  drawLine(trueTrail,'#ffffff',true);
+  GROUPS.forEach(g=>drawLine(filters[g].trail,COLOR[g],false));
+}
+function drawErr(){
+  const ctx=errCtx, W=errCanvas.width, Ht=errCanvas.height;
+  ctx.clearRect(0,0,W,Ht);
+  const maxLen=Math.max(1,...GROUPS.map(g=>filters[g].errHist.length));
+  const tArr=Array.from({length:maxLen},(_,i)=>i*DT);
+  const tMax=Math.max(20,tArr[tArr.length-1]||20);
+  let maxErr=0.2; GROUPS.forEach(g=>filters[g].errHist.forEach(e=>{if(e>maxErr)maxErr=e;}));
+  maxErr*=1.1;
+  // gridlines
+  ctx.strokeStyle='#2a3348'; ctx.lineWidth=1*devicePixelRatio; ctx.font=`${11*devicePixelRatio}px sans-serif`; ctx.fillStyle='#8a92a8';
+  for(let i=0;i<=4;i++){const yy=Ht-(i/4)*Ht; ctx.beginPath();ctx.moveTo(0,yy);ctx.lineTo(W,yy);ctx.stroke();
+    ctx.fillText((maxErr*i/4).toFixed(2), 4*devicePixelRatio, yy-3*devicePixelRatio);}
+  GROUPS.forEach(g=>{
+    const hist=filters[g].errHist; if(hist.length<2)return;
+    ctx.beginPath(); ctx.strokeStyle=COLOR[g]; ctx.lineWidth=2*devicePixelRatio;
+    hist.forEach((e,i)=>{const X=(i/(maxLen-1))*W; const Y=Ht-(e/maxErr)*Ht; if(i===0)ctx.moveTo(X,Y); else ctx.lineTo(X,Y);});
+    ctx.stroke();
+  });
+}
+function updateStatusTable(){
+  let html='<tr><th>Group</th><th>enc</th><th>flow</th><th>imu</th><th>err(m)</th></tr>';
+  GROUPS.forEach(g=>{
+    const f=filters[g];
+    const err=f.errHist.length?f.errHist[f.errHist.length-1]:0;
+    const pills=f.suppressed.map(s=>`<span class="pill ${s?'supp':'ok'}">${s?'SUPP':'ok'}</span>`).join('</td><td>');
+    html+=`<tr><td>${LABEL[g]}</td><td>${pills}</td><td class="errbig" style="color:${COLOR[g]}">${err.toFixed(3)}</td></tr>`;
+  });
+  document.getElementById('statusTable').innerHTML=html;
+}
+
+function tick(){
+  const [vTrue,omegaTrue]=robot.step(); const t=robot.t;
+  const sigEnc=currentSigma('enc',SIG0.enc), sigFlow=currentSigma('flow',SIG0.flow), sigImu=currentSigma('imu',SIG0.imu);
+  const biasEnc = t<faultEnd.enc? faultBiasEnc:0;
+  const zEnc=vTrue+biasEnc+randn()*sigEnc, zFlow=vTrue+randn()*sigFlow, zImu=omegaTrue+randn()*sigImu;
+  const z=[zEnc,zFlow,zImu];
+  trueTrail.push([robot.x,robot.y]); if(trueTrail.length>1200)trueTrail.shift();
+  GROUPS.forEach(g=>{
+    const f=filters[g]; f.step(z);
+    const err=Math.hypot(f.x[0]-robot.x, f.x[1]-robot.y);
+    f.errHist.push(err); if(f.errHist.length>400)f.errHist.shift();
+  });
+  document.getElementById('simtime').textContent=`t = ${t.toFixed(1)}s`;
+  const active=['enc','flow','imu'].filter(s=>t<faultEnd[s]);
+  document.getElementById('activefaults').textContent = 'faults: '+(active.length?active.join(', '):'none');
+  drawTraj(); drawErr(); updateStatusTable();
+}
+
+resizeCanvases(); resetSim();
+setInterval(tick, DT*1000);
+</script>
+</body>
+</html>
